@@ -35,16 +35,24 @@ import pipeline as pl_mod
 from evaluate import blocking_diagnostics, macro_f_beta
 
 
-def run_validate(data_dir: str, out_dir: str, model_out: str, n_folds: int) -> None:
+def run_validate(data_dir: str, out_dir: str, model_out: str, n_folds: int, max_s1: int = None) -> None:
     t0 = time.time()
-    s1 = pl_mod.load_and_normalize(os.path.join(data_dir, "train_source1.tsv"))
-    pl_mod.log(f"loaded+normalized s1={len(s1.ids)}", t0)
+    s1 = pl_mod.load_and_normalize(os.path.join(data_dir, "train_source1.tsv"), sample_n=max_s1)
+    pl_mod.log(f"loaded+normalized s1={len(s1.ids)}" + (f" (sampled from full set, max_s1={max_s1})" if max_s1 else ""), t0)
     s2 = pl_mod.load_raw(os.path.join(data_dir, "train_source2.tsv"))
     s3 = pl_mod.load_raw(os.path.join(data_dir, "train_source3.tsv"))
     pl_mod.log(f"loaded raw s2={len(s2.ids)} s3={len(s3.ids)}", t0)
 
     gt_df = io_utils.read_ground_truth(os.path.join(data_dir, "train_ground_truth.tsv"))
     ground_truth = io_utils.ground_truth_to_dict(gt_df)
+    if max_s1:
+        # Restrict to the sampled ids -- otherwise every diagnostic/score
+        # below would silently average in millions of untouched entities
+        # (candidates.get(id, []) == [] for every id we never sampled),
+        # making blocking recall and macro F0.5 both look catastrophically
+        # wrong even though nothing is actually broken.
+        s1_id_set = set(s1.ids)
+        ground_truth = {k: v for k, v in ground_truth.items() if k in s1_id_set}
     pl_mod.log(f"loaded ground truth for {len(ground_truth)} entities", t0)
 
     idx_s2 = pl_mod.build_country_indexes_lazy(s2)
@@ -155,11 +163,16 @@ def main():
     ap.add_argument("--model-out", default=None, help="where to save models (validate mode)")
     ap.add_argument("--model-in", default=None, help="where to load models from (predict mode)")
     ap.add_argument("--n-folds", type=int, default=5)
+    ap.add_argument("--max-s1", type=int, default=None,
+                     help="train on a random sample of this many Source-1 entities "
+                          "instead of every one (validate mode only) -- bounds the "
+                          "expensive candidate-gen/featurize/train stages while still "
+                          "indexing the full, real Source 2/3 candidate pool.")
     args = ap.parse_args()
 
     if args.mode == "validate":
         model_out = args.model_out or os.path.join(args.out_dir, "models.pkl")
-        run_validate(args.data_dir, args.out_dir, model_out, args.n_folds)
+        run_validate(args.data_dir, args.out_dir, model_out, args.n_folds, max_s1=args.max_s1)
     else:
         if not args.model_in:
             raise SystemExit("--model-in is required for --mode predict")

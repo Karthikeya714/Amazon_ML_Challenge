@@ -70,8 +70,18 @@ class RawSource:
     id_to_row: Dict[str, int]
 
 
-def load_and_normalize(path: str) -> SourceRecords:
+def load_and_normalize(path: str, sample_n: Optional[int] = None, seed: int = 0) -> SourceRecords:
+    """``sample_n`` bounds *this* function's output to a random subset of
+    rows -- used only for Source 1 in --mode validate under a deadline
+    (see run_pipeline.py): a large representative sample trains a robust
+    matcher in a fraction of the time a full 883K-2.2M-entity training pass
+    costs, without touching the full, real Source 2/3 candidate pool (so
+    blocking/recall/precision still reflect real corpus density). Never
+    used for --mode predict, which must cover every Source-1 test entity.
+    """
     df = io_utils.read_source(path)
+    if sample_n is not None and sample_n < df.height:
+        df = df.sample(n=sample_n, seed=seed)
     ids = df["entity_id"].to_list()
     raw_names = df["business_name"].to_list()
     raw_addrs = df["business_address"].to_list()
