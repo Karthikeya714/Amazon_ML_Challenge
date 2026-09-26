@@ -34,11 +34,39 @@ ALL_FEATURE_NAMES = FEATURE_NAMES + CONTEXT_FEATURE_NAMES
 
 @dataclass
 class SourceRecords:
-    """One source file's records, normalized once and kept by entity_id."""
+    """One source file's records, normalized once and kept by entity_id.
+
+    Used for Source 1 only (~2.2M rows train / ~1.7M test at worst): small
+    enough to hold entirely in memory, and every S1 record's own normalized
+    name/address is needed repeatedly (once per candidate it retrieves), so
+    eager normalization is the right tradeoff there.
+    """
     ids: List[str]
     names: Dict[str, "NormalizedName"]
     addrs: Dict[str, "NormalizedAddress"]
     countries: Dict[str, str]
+
+
+@dataclass
+class RawSource:
+    """One Source-2/3 file, kept as plain parallel arrays -- NOT eagerly
+    normalized. At full scale (~5M rows per source), eagerly building a
+    NormalizedName+NormalizedAddress for every row and holding all of it
+    (for S1, S2 *and* S3 simultaneously) measured at ~2.5KB/record on real
+    India data -- about 5GB for Source 2 alone, and enough combined across
+    all three sources to OOM-kill this pipeline's first full-country run
+    (see PLAN.md sec. 12). Source-2/3 records are instead normalized
+    transiently while building the blocking index (`build_country_indexes_lazy`)
+    and, later, on demand for only the (much smaller) set of ids that
+    actually became a candidate for some Source-1 entity
+    (`normalize_needed_ids`) -- never for the ~26-27% of records that are
+    pure noise and never surface as anyone's candidate.
+    """
+    ids: List[str]
+    raw_names: List[str]
+    raw_addrs: List[str]
+    countries: List[str]
+    id_to_row: Dict[str, int]
 
 
 def load_and_normalize(path: str) -> SourceRecords:
@@ -56,7 +84,20 @@ def load_and_normalize(path: str) -> SourceRecords:
     return SourceRecords(ids=ids, names=names, addrs=addrs, countries=country_map)
 
 
+def load_raw(path: str) -> RawSource:
+    df = io_utils.read_source(path)
+    ids = df["entity_id"].to_list()
+    raw_names = df["business_name"].to_list()
+    raw_addrs = df["business_address"].to_list()
+    countries = df["country"].to_list()
+    id_to_row = {eid: i for i, eid in enumerate(ids)}
+    return RawSource(ids=ids, raw_names=raw_names, raw_addrs=raw_addrs, countries=countries, id_to_row=id_to_row)
+
+
 def build_country_indexes(records: SourceRecords) -> Dict[str, CountryBlockIndex]:
+    """Eager-source variant (kept for Source 1, and for tests/small data);
+    see `build_country_indexes_lazy` for the memory-bounded Source-2/3 path.
+    """
     by_country: Dict[str, CountryBlockIndex] = {}
     for eid in records.ids:
         c = records.countries[eid]
@@ -65,6 +106,27 @@ def build_country_indexes(records: SourceRecords) -> Dict[str, CountryBlockIndex
             idx = CountryBlockIndex()
             by_country[c] = idx
         idx.add(len(idx.ids), eid, records.names[eid], records.addrs[eid])
+    for idx in by_country.values():
+        idx.finalize()
+    return by_country
+
+
+def build_country_indexes_lazy(raw: RawSource) -> Dict[str, CountryBlockIndex]:
+    """Same result as `build_country_indexes`, but normalizes each Source-2/3
+    row transiently -- the normalized object is used to update the posting
+    lists and then dropped, never retained in a per-entity dict. This is
+    the memory-bounded path: peak memory here is the index postings alone,
+    not postings-plus-5M-dataclass-instances.
+    """
+    by_country: Dict[str, CountryBlockIndex] = {}
+    for eid, rn, ra, c in zip(raw.ids, raw.raw_names, raw.raw_addrs, raw.countries):
+        idx = by_country.get(c)
+        if idx is None:
+            idx = CountryBlockIndex()
+            by_country[c] = idx
+        name = normalize_name(rn)
+        addr = normalize_address(ra, c)
+        idx.add(len(idx.ids), eid, name, addr)
     for idx in by_country.values():
         idx.finalize()
     return by_country
@@ -100,20 +162,41 @@ def generate_candidates(
     return candidates
 
 
+def _normalize_needed(raw: RawSource, needed_ids: set) -> Dict[str, Tuple["NormalizedName", "NormalizedAddress"]]:
+    """Normalize only the rows in ``needed_ids`` -- the candidate ids that
+    actually surfaced for some Source-1 entity, a small fraction of the
+    full ~5M-row source (see RawSource's docstring). Bounds memory to
+    O(unique candidates touched) instead of O(full corpus)."""
+    out = {}
+    for eid in needed_ids:
+        row = raw.id_to_row.get(eid)
+        if row is None:
+            continue  # shouldn't happen (candidates come from this same source), but never crash on it
+        out[eid] = (normalize_name(raw.raw_names[row]), normalize_address(raw.raw_addrs[row], raw.countries[row]))
+    return out
+
+
 def build_feature_table(
     s1: SourceRecords,
-    s2: SourceRecords,
-    s3: SourceRecords,
+    s2: RawSource,
+    s3: RawSource,
     candidates: Dict[str, List[str]],
     labels: Optional[Dict[str, List[str]]] = None,
 ) -> pl.DataFrame:
+    needed_s2, needed_s3 = set(), set()
+    for cand_list in candidates.values():
+        for cid in cand_list:
+            (needed_s2 if cid.startswith("S2-") else needed_s3).add(cid)
+    norm_s2 = _normalize_needed(s2, needed_s2)
+    norm_s3 = _normalize_needed(s3, needed_s3)
+
     rows = []
     for s1_id, cand_list in candidates.items():
         s1_name, s1_addr = s1.names[s1_id], s1.addrs[s1_id]
         truth_set = set(labels.get(s1_id, [])) if labels is not None else None
         for cand_id in cand_list:
-            src = s2 if cand_id.startswith("S2-") else s3
-            cand_name, cand_addr = src.names[cand_id], src.addrs[cand_id]
+            norm_src = norm_s2 if cand_id.startswith("S2-") else norm_s3
+            cand_name, cand_addr = norm_src[cand_id]
             feats = pair_features(s1_name, s1_addr, cand_name, cand_addr, cand_id)
             feats["s1_id"] = s1_id
             feats["cand_id"] = cand_id

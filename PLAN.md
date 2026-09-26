@@ -252,15 +252,38 @@ it). Deviations from the original plan, and why:
   to 0.55 (random). Fixed by never reordering the table (`.over()` doesn't
   require sorted input) — see the comment left in `pipeline.py` at that
   function. Worth an assertion/test if this pipeline grows further.
+- **A second real bug, this one architectural, found the same way (running
+  at real scale, not by inspection):** the first full-country validation run
+  (all of India: 883K S1 / 2.0M S2 / 2.1M S3) died silently partway through
+  index-building — no traceback, memory back to baseline after, consistent
+  with an OOM kill. Measured directly: normalizing Source 2's 2.02M India
+  records alone into the `NormalizedName`/`NormalizedAddress` dataclasses
+  and holding them in a per-entity dict cost **~5 GB** (~2.5 KB/record) —
+  loading all three sources this way at once (as the original
+  `load_and_normalize` did for every source) doesn't fit this environment's
+  15 GB. Fixed by changing *only* Source 1 (the smaller side, held for the
+  whole run since every candidate lookup needs it) to normalize eagerly;
+  Source 2/3 are now kept as plain parallel arrays (`RawSource`) and
+  normalized **transiently** while building the blocking index (discarded
+  immediately after updating the postings), then re-normalized **on demand**
+  only for the (much smaller) set of ids that actually surfaced as a
+  candidate for some Source-1 entity — never for the ~26-27% of records
+  that are pure noise and never surface as anyone's candidate. Re-ran the
+  subsample after the fix: identical macro F0.5 (0.9579), confirming the
+  refactor is behavior-preserving. Also dropped the unused `raw` field from
+  both normalize dataclasses and added `slots=True` — cheap further
+  per-record memory cuts. This is the kind of bug that specifically only
+  shows up by running the real 5M-row files, not the toy examples in the
+  problem PDF, which is why section 8's validation protocol insists on a
+  full-country check before trusting any number.
 - **Validated results so far** (GroupKFold-by-S1 out-of-fold, so this is a
   legitimate unbiased estimate, not train-set leakage):
   - Small subsample (8,000 S1 + a ~74K-record distractor pool per source,
     for fast iteration): blocking recall ceiling 94.4% at ~50
     candidates/entity, **macro F0.5 = 0.958**.
   - Full India partition (883,188 S1 against the *real* 2.0M/2.1M S2/S3
-    pool — the honest full-scale distractor density): run launched in the
-    background; numbers to be filled in once it completes (full-corpus
-    normalization is the slow part — see the README's scale note).
+    pool — the honest full-scale distractor density): re-launched after the
+    memory fix above; numbers to be filled in once it completes.
   - The gap between those two is exactly the "more distractors → more
     chance false-positive collisions → precision drops a bit" effect flagged
     in section 8's validation protocol; the India-partition number is the

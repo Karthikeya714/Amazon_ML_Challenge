@@ -152,9 +152,12 @@ def is_domain_like(raw: str) -> bool:
     return bool(_DOMAIN_TLD_RE.search(s)) or (" " not in s and len(s) > 8 and any(c.isalpha() for c in s))
 
 
-@dataclass
+@dataclass(slots=True)
 class NormalizedName:
-    raw: str
+    # No `raw` field: at full corpus scale (~5M+ records per source) holding
+    # the original string again here roughly doubles per-record memory for
+    # a value nothing downstream reads (features/blocking use only the
+    # derived forms below) -- see PLAN.md sec. 12 for the OOM this caused.
     norm: str            # lowercase, accents stripped, suffixes/junk removed, abbrevs expanded
     core_tokens: List[str] = field(default_factory=list)
     sorted_core: str = ""       # tokens sorted alphabetically (word-order invariant)
@@ -186,7 +189,6 @@ def normalize_name(raw: str) -> NormalizedName:
     despaced = norm.replace(" ", "")
 
     return NormalizedName(
-        raw=raw,
         norm=norm,
         core_tokens=tokens,
         sorted_core=sorted_core,
@@ -222,9 +224,9 @@ _POSTCODE_RE = re.compile(r"(?<!\d)\d{5}(?:-\d{4})?(?!\d)")
 _HOUSE_NUM_RE = re.compile(r"\b0*(\d{2,}[a-zA-Z]?(?:/\d+[a-zA-Z]?)?)\b")
 
 
-@dataclass
+@dataclass(slots=True)
 class NormalizedAddress:
-    raw: str
+    # No `raw` field -- see NormalizedName's comment above; same reasoning.
     norm: str
     tokens: List[str] = field(default_factory=list)
     postcode: str = ""
@@ -236,7 +238,7 @@ class NormalizedAddress:
 def normalize_address(raw: str, country: str = "") -> NormalizedAddress:
     raw = raw or ""
     if not raw.strip():
-        return NormalizedAddress(raw=raw, norm="", is_missing=True)
+        return NormalizedAddress(norm="", is_missing=True)
 
     s = transliterate_to_latin(raw)
     s = strip_accents(s)
@@ -261,7 +263,6 @@ def normalize_address(raw: str, country: str = "") -> NormalizedAddress:
     norm = " ".join(tokens)
 
     return NormalizedAddress(
-        raw=raw,
         norm=norm,
         tokens=tokens,
         postcode=postcode,

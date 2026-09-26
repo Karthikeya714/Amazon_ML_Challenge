@@ -37,16 +37,17 @@ from evaluate import blocking_diagnostics, macro_f_beta
 def run_validate(data_dir: str, out_dir: str, model_out: str, n_folds: int) -> None:
     t0 = time.time()
     s1 = pl_mod.load_and_normalize(os.path.join(data_dir, "train_source1.tsv"))
-    s2 = pl_mod.load_and_normalize(os.path.join(data_dir, "train_source2.tsv"))
-    s3 = pl_mod.load_and_normalize(os.path.join(data_dir, "train_source3.tsv"))
-    pl_mod.log(f"loaded+normalized s1={len(s1.ids)} s2={len(s2.ids)} s3={len(s3.ids)}", t0)
+    pl_mod.log(f"loaded+normalized s1={len(s1.ids)}", t0)
+    s2 = pl_mod.load_raw(os.path.join(data_dir, "train_source2.tsv"))
+    s3 = pl_mod.load_raw(os.path.join(data_dir, "train_source3.tsv"))
+    pl_mod.log(f"loaded raw s2={len(s2.ids)} s3={len(s3.ids)}", t0)
 
     gt_df = io_utils.read_ground_truth(os.path.join(data_dir, "train_ground_truth.tsv"))
     ground_truth = io_utils.ground_truth_to_dict(gt_df)
     pl_mod.log(f"loaded ground truth for {len(ground_truth)} entities", t0)
 
-    idx_s2 = pl_mod.build_country_indexes(s2)
-    idx_s3 = pl_mod.build_country_indexes(s3)
+    idx_s2 = pl_mod.build_country_indexes_lazy(s2)
+    idx_s3 = pl_mod.build_country_indexes_lazy(s3)
     pl_mod.log(f"built blocking indexes: s2 countries={list(idx_s2)} s3 countries={list(idx_s3)}", t0)
 
     candidates = pl_mod.generate_candidates(s1, idx_s2, idx_s3)
@@ -95,12 +96,13 @@ def run_predict(data_dir: str, out_dir: str, model_in: str) -> None:
     models, tau = saved["models"], saved["tau"]
 
     s1 = pl_mod.load_and_normalize(os.path.join(data_dir, "test_source1.tsv"))
-    s2 = pl_mod.load_and_normalize(os.path.join(data_dir, "test_source2.tsv"))
-    s3 = pl_mod.load_and_normalize(os.path.join(data_dir, "test_source3.tsv"))
-    pl_mod.log(f"loaded+normalized s1={len(s1.ids)} s2={len(s2.ids)} s3={len(s3.ids)}", t0)
+    pl_mod.log(f"loaded+normalized s1={len(s1.ids)}", t0)
+    s2 = pl_mod.load_raw(os.path.join(data_dir, "test_source2.tsv"))
+    s3 = pl_mod.load_raw(os.path.join(data_dir, "test_source3.tsv"))
+    pl_mod.log(f"loaded raw s2={len(s2.ids)} s3={len(s3.ids)}", t0)
 
-    idx_s2 = pl_mod.build_country_indexes(s2)
-    idx_s3 = pl_mod.build_country_indexes(s3)
+    idx_s2 = pl_mod.build_country_indexes_lazy(s2)
+    idx_s3 = pl_mod.build_country_indexes_lazy(s3)
     candidates = pl_mod.generate_candidates(s1, idx_s2, idx_s3)
     pl_mod.log("candidates generated", t0)
 
