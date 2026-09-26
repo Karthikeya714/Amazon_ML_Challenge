@@ -25,6 +25,7 @@ Example (from this directory)::
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import pickle
 import time
@@ -56,6 +57,15 @@ def run_validate(data_dir: str, out_dir: str, model_out: str, n_folds: int) -> N
 
     table = pl_mod.build_feature_table(s1, s2, s3, candidates, labels=ground_truth)
     pl_mod.log(f"feature table built: {table.shape}", t0)
+
+    # Nothing below needs the raw sources, the posting indexes, or the
+    # original candidates dict (candidate_map is rebuilt from `table`
+    # itself later) -- freeing them here matters at full scale: the
+    # training stage below builds its own multi-GB feature arrays, and
+    # these were previously left alive throughout, stacking on top of it.
+    del s2, s3, idx_s2, idx_s3, candidates
+    gc.collect()
+    pl_mod.log("freed raw sources/indexes before training", t0)
 
     table, models = pl_mod.train_two_stage(table, n_folds=n_folds)
     pl_mod.log("two-stage GroupKFold training complete", t0)
@@ -108,6 +118,9 @@ def run_predict(data_dir: str, out_dir: str, model_in: str) -> None:
 
     table = pl_mod.build_feature_table(s1, s2, s3, candidates, labels=None)
     pl_mod.log(f"feature table built: {table.shape}", t0)
+
+    del s2, s3, idx_s2, idx_s3, candidates
+    gc.collect()
 
     table = pl_mod.predict_with_models(table, models)
     table = pl_mod.apply_one_owner_constraint(table, prob_col="prob")

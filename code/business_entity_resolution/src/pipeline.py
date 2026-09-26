@@ -280,7 +280,7 @@ def train_two_stage(table: pl.DataFrame, n_folds: int = 5, seed: int = 0) -> Tup
     """
     y = table["label"].to_numpy()
     groups = table["s1_id"].to_numpy()
-    X1 = table.select(FEATURE_NAMES).to_numpy()
+    X1 = table.select(FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
 
     gkf = GroupKFold(n_splits=n_folds)
     oof1 = np.zeros(len(table))
@@ -293,11 +293,14 @@ def train_two_stage(table: pl.DataFrame, n_folds: int = 5, seed: int = 0) -> Tup
         clf.fit(X1[tr_idx], y[tr_idx])
         oof1[va_idx] = clf.predict_proba(X1[va_idx])[:, 1]
         models1.append(clf)
+    del X1  # freed before X2 is built -- the two were alive simultaneously
+    # before this fix, on top of the feature table itself, stacking close
+    # to this environment's memory ceiling at full India scale (~34M rows).
 
     table = table.with_columns(pl.Series("stage1_prob", oof1))
     table = add_context_features(table, "stage1_prob")
 
-    X2 = table.select(ALL_FEATURE_NAMES).to_numpy()
+    X2 = table.select(ALL_FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
     oof2 = np.zeros(len(table))
     models2 = []
     for tr_idx, va_idx in gkf.split(X2, y, groups):
@@ -363,12 +366,13 @@ def predict_with_models(table: pl.DataFrame, models: dict) -> pl.DataFrame:
     """Inference-time scoring on the (unlabeled) test candidate table,
     averaging the CV folds' models -- no OOF trick needed since there is no
     label to leak."""
-    X1 = table.select(FEATURE_NAMES).to_numpy()
+    X1 = table.select(FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
     stage1 = np.mean([m.predict_proba(X1)[:, 1] for m in models["models1"]], axis=0)
+    del X1
     table = table.with_columns(pl.Series("stage1_prob", stage1))
     table = add_context_features(table, "stage1_prob")
 
-    X2 = table.select(ALL_FEATURE_NAMES).to_numpy()
+    X2 = table.select(ALL_FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
     stage2 = np.mean([m.predict_proba(X2)[:, 1] for m in models["models2"]], axis=0)
     calibrated = models["isotonic"].predict(stage2)
     table = table.with_columns(pl.Series("prob_raw", stage2), pl.Series("prob", calibrated))
