@@ -55,15 +55,22 @@ def run_validate(data_dir: str, out_dir: str, model_out: str, n_folds: int) -> N
     diag = blocking_diagnostics(candidates, ground_truth)
     pl_mod.log(f"blocking diagnostics: {diag}", t0)
 
+    # idx_s2/idx_s3 are consumed entirely by generate_candidates above --
+    # build_feature_table only needs s1/s2/s3(raw)/candidates. Freeing the
+    # posting indexes *here*, not after build_feature_table, matters at
+    # full scale: the previous full-country attempt still died inside
+    # build_feature_table with these (multi-GB at the raised max_df_abs)
+    # sitting unused in memory the whole time.
+    del idx_s2, idx_s3
+    gc.collect()
+
     table = pl_mod.build_feature_table(s1, s2, s3, candidates, labels=ground_truth)
     pl_mod.log(f"feature table built: {table.shape}", t0)
 
-    # Nothing below needs the raw sources, the posting indexes, or the
-    # original candidates dict (candidate_map is rebuilt from `table`
-    # itself later) -- freeing them here matters at full scale: the
-    # training stage below builds its own multi-GB feature arrays, and
-    # these were previously left alive throughout, stacking on top of it.
-    del s2, s3, idx_s2, idx_s3, candidates
+    # Nothing below needs the raw sources or the original candidates dict
+    # (candidate_map is rebuilt from `table` itself later) -- the training
+    # stage below builds its own multi-GB feature arrays.
+    del s2, s3, candidates
     gc.collect()
     pl_mod.log("freed raw sources/indexes before training", t0)
 
@@ -115,11 +122,13 @@ def run_predict(data_dir: str, out_dir: str, model_in: str) -> None:
     idx_s3 = pl_mod.build_country_indexes_lazy(s3)
     candidates = pl_mod.generate_candidates(s1, idx_s2, idx_s3)
     pl_mod.log("candidates generated", t0)
+    del idx_s2, idx_s3
+    gc.collect()
 
     table = pl_mod.build_feature_table(s1, s2, s3, candidates, labels=None)
     pl_mod.log(f"feature table built: {table.shape}", t0)
 
-    del s2, s3, idx_s2, idx_s3, candidates
+    del s2, s3, candidates
     gc.collect()
 
     table = pl_mod.predict_with_models(table, models)
