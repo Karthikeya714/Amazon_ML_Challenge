@@ -103,13 +103,24 @@ class CountryBlockIndex:
     house-number) for one (source, country) partition."""
 
     def __init__(self):
-        self.name_token_idx = PostingIndex(max_df_ratio=0.02, min_token_len=2, max_df_abs=400)
-        self.char_ngram_idx = PostingIndex(max_df_ratio=0.02, min_token_len=CHAR_NGRAM_N, max_df_abs=400)
+        # max_df_abs=400 (tried first) protected generate_candidates from
+        # the OOM in PLAN.md sec. 12, but measured on the real, full India
+        # partition it also cut blocking recall from 94.4% (small
+        # subsample) to 53.6%: at 2M+ real documents, plenty of genuinely
+        # discriminative tokens (a common Indian city/locality name, a
+        # frequent-but-real name word) legitimately exceed 400 postings and
+        # were being dropped from the index entirely. Raised once
+        # generate_candidates' *own* memory use was confirmed bounded
+        # (batch_pairs in build_feature_table was the actual remaining
+        # bottleneck) -- this cap only needs to keep any single index
+        # lookup cheap, not to protect memory by itself anymore.
+        self.name_token_idx = PostingIndex(max_df_ratio=0.02, min_token_len=2, max_df_abs=1500)
+        self.char_ngram_idx = PostingIndex(max_df_ratio=0.02, min_token_len=CHAR_NGRAM_N, max_df_abs=1500)
         # Postcode is a strong signal even when shared by many businesses
         # (a dense zip code), so it keeps a looser absolute cap than the
         # weaker/noisier name-token and char-ngram signals.
-        self.postcode_idx = PostingIndex(max_df_ratio=0.5, min_token_len=3, max_df_abs=2000)
-        self.house_num_idx = PostingIndex(max_df_ratio=0.05, min_token_len=1, max_df_abs=400)
+        self.postcode_idx = PostingIndex(max_df_ratio=0.5, min_token_len=3, max_df_abs=3000)
+        self.house_num_idx = PostingIndex(max_df_ratio=0.05, min_token_len=1, max_df_abs=1500)
         self.ids: List[str] = []
 
     def add(self, row_idx: int, entity_id: str, name: NormalizedName, addr: NormalizedAddress) -> None:

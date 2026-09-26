@@ -185,15 +185,42 @@ def build_feature_table(
     s3: RawSource,
     candidates: Dict[str, List[str]],
     labels: Optional[Dict[str, List[str]]] = None,
+    batch_pairs: int = 200_000,
 ) -> pl.DataFrame:
+    """Builds the (s1_id, cand_id, *features[, label]) table.
+
+    Materializes at most ``batch_pairs`` per-pair Python dicts at a time,
+    flushing each batch into a compact Arrow-backed `pl.DataFrame` chunk
+    before starting the next. Building the whole thing as one Python
+    list-of-dicts (the original implementation) is what silently OOM-killed
+    the first full-country validation run to reach this stage: at ~39
+    candidates/entity over 883K Source-1 entities that's ~34M individual
+    ~28-key dicts alive simultaneously, dwarfing every earlier memory issue
+    in this pipeline (see PLAN.md sec. 12). Chunking bounds live Python
+    objects to one batch; the concatenated Arrow table for the full 34M
+    rows is a few GB, not tens of GB.
+    """
     needed_s2, needed_s3 = set(), set()
     for cand_list in candidates.values():
         for cid in cand_list:
             (needed_s2 if cid.startswith("S2-") else needed_s3).add(cid)
     norm_s2 = _normalize_needed(s2, needed_s2)
     norm_s3 = _normalize_needed(s3, needed_s3)
+    del needed_s2, needed_s3
 
-    rows = []
+    cols = ["s1_id", "cand_id"] + FEATURE_NAMES + (["label"] if labels is not None else [])
+    chunks: List[pl.DataFrame] = []
+    rows: List[dict] = []
+
+    def flush():
+        nonlocal rows
+        if rows:
+            df = pl.DataFrame(rows)
+            float_cols = [c for c in FEATURE_NAMES if c in df.columns]
+            df = df.with_columns([pl.col(c).cast(pl.Float32) for c in float_cols])
+            chunks.append(df)
+            rows = []
+
     for s1_id, cand_list in candidates.items():
         s1_name, s1_addr = s1.names[s1_id], s1.addrs[s1_id]
         truth_set = set(labels.get(s1_id, [])) if labels is not None else None
@@ -206,10 +233,13 @@ def build_feature_table(
             if truth_set is not None:
                 feats["label"] = int(cand_id in truth_set)
             rows.append(feats)
-    if not rows:
-        cols = ["s1_id", "cand_id"] + FEATURE_NAMES + (["label"] if labels is not None else [])
+        if len(rows) >= batch_pairs:
+            flush()
+    flush()
+
+    if not chunks:
         return pl.DataFrame({c: [] for c in cols})
-    return pl.DataFrame(rows)
+    return pl.concat(chunks, how="vertical")
 
 
 def add_context_features(table: pl.DataFrame, score_col: str) -> pl.DataFrame:
