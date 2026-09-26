@@ -148,7 +148,10 @@ def generate_candidates(
     as a "small candidate set").
     """
     candidates: Dict[str, List[str]] = {}
-    for eid in s1.ids:
+    t0 = time.time()
+    for i, eid in enumerate(s1.ids):
+        if i and i % 100_000 == 0:
+            print(f"  generate_candidates: {i}/{len(s1.ids)} ({time.time()-t0:.0f}s elapsed)", flush=True)
         c = s1.countries[eid]
         name, addr = s1.names[eid], s1.addrs[eid]
         cand_ids: List[str] = []

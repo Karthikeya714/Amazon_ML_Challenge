@@ -45,11 +45,22 @@ def char_ngrams(s: str, n: int = CHAR_NGRAM_N) -> List[str]:
 
 
 class PostingIndex:
-    """token -> list[row_index] postings, with a document-frequency cap."""
+    """token -> list[row_index] postings, with a document-frequency cap.
 
-    def __init__(self, max_df_ratio: float = 0.02, min_token_len: int = 2):
+    ``max_df_ratio`` alone doesn't scale: calibrated at ~1,400 entries on a
+    73K-document subsample, the *same ratio* allows posting lists up to
+    ~40,000 entries at India's real 2M-document scale -- and every one of
+    883K candidate-generation calls that hits such a token then churns
+    through a 40,000-entry list. That's what silently OOM-killed the first
+    full-country run (see PLAN.md sec. 12). ``max_df_abs`` bounds the
+    survival cutoff in absolute terms regardless of corpus size, so a
+    posting list is never huge just because the corpus got bigger.
+    """
+
+    def __init__(self, max_df_ratio: float = 0.02, min_token_len: int = 2, max_df_abs: int = 500):
         self.max_df_ratio = max_df_ratio
         self.min_token_len = min_token_len
+        self.max_df_abs = max_df_abs
         self.postings: Dict[str, List[int]] = defaultdict(list)
         self.n_docs = 0
         self._built = False
@@ -68,7 +79,7 @@ class PostingIndex:
     def finalize(self) -> None:
         if self._built:
             return
-        max_docs = max(1, int(self.n_docs * self.max_df_ratio))
+        max_docs = max(1, min(int(self.n_docs * self.max_df_ratio), self.max_df_abs))
         drop = [t for t, lst in self.postings.items() if len(lst) > max_docs]
         for t in drop:
             del self.postings[t]
@@ -92,10 +103,13 @@ class CountryBlockIndex:
     house-number) for one (source, country) partition."""
 
     def __init__(self):
-        self.name_token_idx = PostingIndex(max_df_ratio=0.02, min_token_len=2)
-        self.char_ngram_idx = PostingIndex(max_df_ratio=0.02, min_token_len=CHAR_NGRAM_N)
-        self.postcode_idx = PostingIndex(max_df_ratio=0.5, min_token_len=3)
-        self.house_num_idx = PostingIndex(max_df_ratio=0.05, min_token_len=1)
+        self.name_token_idx = PostingIndex(max_df_ratio=0.02, min_token_len=2, max_df_abs=400)
+        self.char_ngram_idx = PostingIndex(max_df_ratio=0.02, min_token_len=CHAR_NGRAM_N, max_df_abs=400)
+        # Postcode is a strong signal even when shared by many businesses
+        # (a dense zip code), so it keeps a looser absolute cap than the
+        # weaker/noisier name-token and char-ngram signals.
+        self.postcode_idx = PostingIndex(max_df_ratio=0.5, min_token_len=3, max_df_abs=2000)
+        self.house_num_idx = PostingIndex(max_df_ratio=0.05, min_token_len=1, max_df_abs=400)
         self.ids: List[str] = []
 
     def add(self, row_idx: int, entity_id: str, name: NormalizedName, addr: NormalizedAddress) -> None:
