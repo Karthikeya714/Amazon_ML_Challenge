@@ -165,18 +165,34 @@ def generate_candidates(
     return candidates
 
 
-def _normalize_needed(raw: RawSource, needed_ids: set) -> Dict[str, Tuple["NormalizedName", "NormalizedAddress"]]:
-    """Normalize only the rows in ``needed_ids`` -- the candidate ids that
-    actually surfaced for some Source-1 entity, a small fraction of the
-    full ~5M-row source (see RawSource's docstring). Bounds memory to
-    O(unique candidates touched) instead of O(full corpus)."""
-    out = {}
-    for eid in needed_ids:
-        row = raw.id_to_row.get(eid)
-        if row is None:
-            continue  # shouldn't happen (candidates come from this same source), but never crash on it
-        out[eid] = (normalize_name(raw.raw_names[row]), normalize_address(raw.raw_addrs[row], raw.countries[row]))
-    return out
+def _get_normalized(
+    raw: RawSource, eid: str, cache: Dict[str, Tuple["NormalizedName", "NormalizedAddress"]], cache_cap: int
+) -> Tuple["NormalizedName", "NormalizedAddress"]:
+    """Normalize one Source-2/3 record on demand, through a small bounded
+    FIFO cache (not an unbounded per-run dict of every touched id).
+
+    The previous version of this pipeline (`_normalize_needed`, removed)
+    collected the full set of unique candidate ids across *all* Source-1
+    entities first, then normalized and held every one of them for the rest
+    of the run. That is what actually OOM-killed six consecutive
+    full-country attempts (see PLAN.md sec. 12): at ~48 candidates/entity
+    over 883K Source-1 entities, the unique-touched-id set is millions of
+    records, several GB just for that cache -- built *before* the batching
+    fix even had a chance to bound anything, since it ran as one eager
+    pre-pass. Bounding the cache size trades some repeat-normalization CPU
+    cost (a record touched by several Source-1 entities may be
+    re-normalized more than once if it falls out of the window) for a hard
+    memory ceiling independent of corpus size or candidate density.
+    """
+    cached = cache.get(eid)
+    if cached is not None:
+        return cached
+    row = raw.id_to_row[eid]
+    result = (normalize_name(raw.raw_names[row]), normalize_address(raw.raw_addrs[row], raw.countries[row]))
+    cache[eid] = result
+    if len(cache) > cache_cap:
+        cache.pop(next(iter(cache)))  # evict oldest-inserted (FIFO; dicts preserve insertion order)
+    return result
 
 
 def build_feature_table(
@@ -200,33 +216,40 @@ def build_feature_table(
     objects to one batch; the concatenated Arrow table for the full 34M
     rows is a few GB, not tens of GB.
     """
-    needed_s2, needed_s3 = set(), set()
-    for cand_list in candidates.values():
-        for cid in cand_list:
-            (needed_s2 if cid.startswith("S2-") else needed_s3).add(cid)
-    norm_s2 = _normalize_needed(s2, needed_s2)
-    norm_s3 = _normalize_needed(s3, needed_s3)
-    del needed_s2, needed_s3
-
     cols = ["s1_id", "cand_id"] + FEATURE_NAMES + (["label"] if labels is not None else [])
     chunks: List[pl.DataFrame] = []
     rows: List[dict] = []
+    cache_s2: Dict[str, Tuple["NormalizedName", "NormalizedAddress"]] = {}
+    cache_s3: Dict[str, Tuple["NormalizedName", "NormalizedAddress"]] = {}
+    cache_cap = 300_000  # ~300K entries * ~2.5KB/record measured on real data -> well under 1GB per cache
+
+    t0 = time.time()
+    n_flushes = 0
 
     def flush():
-        nonlocal rows
+        nonlocal rows, n_flushes
         if rows:
             df = pl.DataFrame(rows)
             float_cols = [c for c in FEATURE_NAMES if c in df.columns]
             df = df.with_columns([pl.col(c).cast(pl.Float32) for c in float_cols])
             chunks.append(df)
             rows = []
+            n_flushes += 1
+            if n_flushes % 10 == 0:
+                import resource
+                rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                print(f"  build_feature_table: {n_flushes} batches flushed "
+                      f"({n_flushes * batch_pairs:,} pairs so far, {time.time()-t0:.0f}s elapsed, "
+                      f"rss={rss_mb:.0f}MB)", flush=True)
 
     for s1_id, cand_list in candidates.items():
         s1_name, s1_addr = s1.names[s1_id], s1.addrs[s1_id]
         truth_set = set(labels.get(s1_id, [])) if labels is not None else None
         for cand_id in cand_list:
-            norm_src = norm_s2 if cand_id.startswith("S2-") else norm_s3
-            cand_name, cand_addr = norm_src[cand_id]
+            if cand_id.startswith("S2-"):
+                cand_name, cand_addr = _get_normalized(s2, cand_id, cache_s2, cache_cap)
+            else:
+                cand_name, cand_addr = _get_normalized(s3, cand_id, cache_s3, cache_cap)
             feats = pair_features(s1_name, s1_addr, cand_name, cand_addr, cand_id)
             feats["s1_id"] = s1_id
             feats["cand_id"] = cand_id
