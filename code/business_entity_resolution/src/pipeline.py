@@ -8,6 +8,7 @@ logic.
 """
 from __future__ import annotations
 
+import gc
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -298,15 +299,31 @@ def train_two_stage(table: pl.DataFrame, n_folds: int = 5, seed: int = 0) -> Tup
     stage 1 = pairwise features only -> OOF prob; context features are
     computed from that OOF prob (safe, since it never used this fold's
     labels); stage 2 = pairwise + context -> final OOF prob, isotonic
-    calibrated. Returns the table with an added ``prob`` column and the two
-    fitted models (for reuse at inference time on the test set).
+    calibrated. Returns a *slim* table (s1_id, cand_id, label, prob columns
+    only -- everything downstream of this function only ever reads those)
+    and the two fitted models (for reuse at inference time on the test set).
+
+    Deliberately never re-selects FEATURE_NAMES back out of a polars
+    DataFrame after `X1` is built: at full India scale (42.5M rows) the
+    original version kept the full feature table (~6.5GB) alive throughout
+    training *in addition to* the numpy `X1`/`X2` copies of the very same
+    feature values (~4-5GB each) -- during a fold's `.fit()` that stacked
+    with LightGBM's own binned dataset and the training-slice copy to
+    roughly the full 15GB ceiling (see PLAN.md sec. 12; this was the crash
+    after "feature table built" finally printed). Context features are
+    instead computed on a slim id-only frame and combined with `X1` via
+    `np.hstack`, so the pairwise feature values only ever exist once, as
+    the numpy array actually being trained on.
     """
     y = table["label"].to_numpy()
     groups = table["s1_id"].to_numpy()
     X1 = table.select(FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
+    slim = table.select(["s1_id", "cand_id", "label"])
+    del table
+    gc.collect()
 
     gkf = GroupKFold(n_splits=n_folds)
-    oof1 = np.zeros(len(table))
+    oof1 = np.zeros(len(y))
     models1 = []
     for tr_idx, va_idx in gkf.split(X1, y, groups):
         clf = lgb.LGBMClassifier(
@@ -316,15 +333,15 @@ def train_two_stage(table: pl.DataFrame, n_folds: int = 5, seed: int = 0) -> Tup
         clf.fit(X1[tr_idx], y[tr_idx])
         oof1[va_idx] = clf.predict_proba(X1[va_idx])[:, 1]
         models1.append(clf)
-    del X1  # freed before X2 is built -- the two were alive simultaneously
-    # before this fix, on top of the feature table itself, stacking close
-    # to this environment's memory ceiling at full India scale (~34M rows).
 
-    table = table.with_columns(pl.Series("stage1_prob", oof1))
-    table = add_context_features(table, "stage1_prob")
+    slim = slim.with_columns(pl.Series("stage1_prob", oof1))
+    slim = add_context_features(slim, "stage1_prob")
+    context_arr = slim.select(CONTEXT_FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
+    X2 = np.hstack([X1, context_arr])
+    del X1, context_arr
+    gc.collect()
 
-    X2 = table.select(ALL_FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
-    oof2 = np.zeros(len(table))
+    oof2 = np.zeros(len(y))
     models2 = []
     for tr_idx, va_idx in gkf.split(X2, y, groups):
         clf = lgb.LGBMClassifier(
@@ -334,13 +351,15 @@ def train_two_stage(table: pl.DataFrame, n_folds: int = 5, seed: int = 0) -> Tup
         clf.fit(X2[tr_idx], y[tr_idx])
         oof2[va_idx] = clf.predict_proba(X2[va_idx])[:, 1]
         models2.append(clf)
+    del X2
+    gc.collect()
 
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     iso.fit(oof2, y)
     calibrated = iso.predict(oof2)
 
-    table = table.with_columns(pl.Series("prob_raw", oof2), pl.Series("prob", calibrated))
-    return table, {"models1": models1, "models2": models2, "isotonic": iso}
+    slim = slim.with_columns(pl.Series("prob_raw", oof2), pl.Series("prob", calibrated))
+    return slim, {"models1": models1, "models2": models2, "isotonic": iso}
 
 
 def apply_one_owner_constraint(table: pl.DataFrame, prob_col: str = "prob") -> pl.DataFrame:
@@ -388,18 +407,27 @@ def candidates_dict_from_table(table: pl.DataFrame) -> Dict[str, List[str]]:
 def predict_with_models(table: pl.DataFrame, models: dict) -> pl.DataFrame:
     """Inference-time scoring on the (unlabeled) test candidate table,
     averaging the CV folds' models -- no OOF trick needed since there is no
-    label to leak."""
+    label to leak. Same slim-table approach as `train_two_stage` (see its
+    docstring): never keeps the feature columns in both polars and numpy
+    form at once on the full test set."""
     X1 = table.select(FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
-    stage1 = np.mean([m.predict_proba(X1)[:, 1] for m in models["models1"]], axis=0)
-    del X1
-    table = table.with_columns(pl.Series("stage1_prob", stage1))
-    table = add_context_features(table, "stage1_prob")
+    slim = table.select(["s1_id", "cand_id"])
+    del table
+    gc.collect()
 
-    X2 = table.select(ALL_FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
+    stage1 = np.mean([m.predict_proba(X1)[:, 1] for m in models["models1"]], axis=0)
+    slim = slim.with_columns(pl.Series("stage1_prob", stage1))
+    slim = add_context_features(slim, "stage1_prob")
+    context_arr = slim.select(CONTEXT_FEATURE_NAMES).to_numpy().astype(np.float32, copy=False)
+    X2 = np.hstack([X1, context_arr])
+    del X1, context_arr
+    gc.collect()
+
     stage2 = np.mean([m.predict_proba(X2)[:, 1] for m in models["models2"]], axis=0)
+    del X2
     calibrated = models["isotonic"].predict(stage2)
-    table = table.with_columns(pl.Series("prob_raw", stage2), pl.Series("prob", calibrated))
-    return table
+    slim = slim.with_columns(pl.Series("prob_raw", stage2), pl.Series("prob", calibrated))
+    return slim
 
 
 def log(msg: str, t0: float) -> None:
