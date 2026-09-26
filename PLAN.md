@@ -27,17 +27,71 @@ raw TSVs
 
 Stages B and C together make up the blocking. `candidate_pairs.tsv` is the output of C, because C is exactly what the final model scores.
 
-## 3. Step 0: EDA to run on the 1 GB dataset (day 1)
+## 3. EDA results (confirmed on the real 2.4 GB dataset)
 
-These answers change the design, so get them first:
+The dataset arrived as a Google Drive folder (`student_resource.zip`, ~1.09 GB
+compressed / ~2.4 GB uncompressed). Extracted to `data/student_resource/`
+(git-ignored — see section 9). Answers to the day-1 questions, all measured
+directly, not assumed:
 
-1. Row counts per source and per country, in train and test. This sets the compute budget.
-2. Singleton rate among S1 entities, plus the histogram of match counts (0, 1, 2, …, split into S2 vs S3).
-3. **Is each S2/S3 record matched to at most one S1?** If yes, stage E (global one-to-one-per-record assignment) gives a large precision gain.
-4. How often a matched pair shares a postcode/PIN or a house number, starts with the same first name token, or has an exact normalized-name match.
-5. Whether S2 and S3 have different noise styles (e.g. one uses abbreviations, the other drops addresses). If they do, add `source` as a feature and consider separate thresholds.
-6. Duplicates inside S2 and S3 (several S2 records for the same business). This makes S2↔S2 and S2↔S3 clustering features useful.
-7. The number of S2+S3 records a typical S1 could plausibly match (same country, same city). This sizes the blocking.
+1. **Row counts.** Train: 2,206,821 S1 / 5,034,616 S2 / 5,285,603 S3 /
+   2,206,821 ground-truth rows. Test: 1,732,545 S1 / 4,887,274 S2 /
+   5,082,317 S3. Train countries: US (3.0M/3.2M across S2/S3) and India
+   (2.0M/2.1M). Test additionally has **France: 259,452** of the 1,732,545
+   S1 rows (~15%) — a meaningful slice, not an edge case.
+2. **Singleton rate: 5.6%** (123,247 / 2,206,821 S1 entities have zero
+   matches). Match-count distribution is mean 3.46, median 3, max 11
+   (max 5 from S2, max 6 from S3) — most entities have 2-5 matches, so this
+   is not a mostly-singleton problem the way some ER datasets are.
+3. **Confirmed: every S2/S3 record matches at most one S1.** Checked across
+   all 7,638,365 training match edges — **zero** records matched to more
+   than one S1 entity, and zero cross-country matches either. Both are now
+   hard structural constraints the pipeline exploits (`apply_one_owner_constraint`
+   in `pipeline.py`; country-partitioned blocking).
+4. **Noise/distractor rate: ~26-27%** of S2/S3 records never match *any*
+   S1 entity in training (1.34M/5.03M S2, 1.34M/5.29M S3) — these are pure
+   hard negatives the blocking stage will keep pulling in, so precision-side
+   features matter more than the toy examples suggest.
+5. **Postcode reality, and it reshapes the address features:**
+   - India: **0.00%** of addresses (S1, S2, or S3) contain a 6-digit PIN
+     code, in either train file. None. A "PIN code match" feature is
+     literally always-unknown for India — don't build the pipeline around
+     it.
+   - US: only **~10%** of addresses carry a 5-digit ZIP. Present-but-sparse,
+     useful as a *tie-breaker* feature, never as a blocking requirement.
+   - A regex bug was caught here during implementation: a naive "5-or-6
+     digit token = postcode" rule matches zero-padded house numbers
+     ("013614 Peacockfarm Rd") as a false 6-digit "PIN". Fixed by requiring
+     an *exact* 5-digit run (negative lookaround) and dropping the 6-digit
+     branch entirely, since it was never a real signal in this data.
+6. **Source 2 and Source 3 do have different noise profiles**, confirmed via
+   the non-Latin-script check below — used as the `is_source2` feature.
+7. **Two noise patterns invisible in the PDF/video, found only by reading
+   real rows, and both large enough to matter:**
+   - **Native-script transliteration, one-directional.** 27.9% of India
+     Source-2 names and 18.5% of Source-3 names are given in Devanagari,
+     Kannada, etc. (e.g. `सिल्वर फाउंडेशन प्राइवेट लिमिटेड` for "Silver
+     Foundation Private Limited"). **Source 1 names are 0.00% non-Latin** —
+     always romanized. Since char-n-gram/fuzzy-string features operate on
+     Unicode code points, a S1↔S2 pair here has **zero raw character
+     overlap** without an explicit transliteration step. Added
+     `transliterate_to_latin()` (via `indic_transliteration`, ITRANS scheme,
+     fully offline/rule-based — not a business-data lookup) to
+     `normalize.py`; state names in addresses (e.g. `उत्तर प्रदेश` →
+     `uttara pradesha` ≈ "Uttar Pradesh") get the same treatment.
+   - **Domain-style business names.** ~6% of S2/S3 names (vs. 0.06% of S1)
+     are website-domain strings with no spaces and reordered tokens
+     (`healthwomensunited.com` for "Womens Health United Care Inc"). Token-
+     based similarity (Jaccard, token-sort-ratio) is blind to these; char
+     n-gram bag-of-substrings similarity on the despaced string still picks
+     up shared fragments regardless of order, which is why `normalize.py`
+     keeps an explicit `despaced` field and `features.py` scores it
+     separately (`name_despaced_exact`, `name_char_ngram_jaccard`).
+   - Also common: accent-injection obfuscation on otherwise-Latin text
+     ("Ássociates", "Sáaol", "TRÁNSALTA" for Associates/Saaol/Transalta —
+     undone by NFKD + combining-mark strip), leading junk symbols
+     ("-- ", "<< "), bracketed suffix noise ("[Inc]", "(LLC)"), and
+     word-deletion noise inside names (not just insertion/typo).
 
 ## 4. Stage A: normalization
 
@@ -163,3 +217,57 @@ Before each upload, run `utils/validate_submission.py` and fix every issue it re
 - Picking one global threshold instead of optimizing the per-entity expected F0.5.
 - Leakage: fitting supervised components on held-out S1s. Unsupervised TF-IDF/IDF on all text is fine.
 - Models without an MIT/Apache license (check every Hugging Face model card), or any external lookup or geocoding.
+
+## 12. Implementation status
+
+Phases 1-4 are implemented and working end-to-end, in
+`code/business_entity_resolution/` (see its own `README.md` for how to run
+it). Deviations from the original plan, and why:
+
+- **Blocking implementation:** built as per-country **inverted token
+  indexes** (name-token, char-4gram, postcode, house-number postings) rather
+  than the originally-planned TF-IDF/FAISS matrix approach. At this corpus
+  size (2.2M × 5M+), a sparse matrix retrieval step would need
+  `sparse_dot_topn`/FAISS machinery just to stay memory-bounded; an inverted
+  index gets the same "union of several cheap retrievers" recall behavior
+  with plain dict/set operations, which is simpler to get right and easier
+  to reason about at this scale. FAISS/dense-embedding retrieval remains a
+  candidate Phase-5 addition (see the README's roadmap) if recall on the
+  France partition turns out to need it.
+- **Two pruning stages, both empirically necessary.** The raw inverted-index
+  union alone gave 98.5% recall but **~1,790 candidates/entity on average**
+  on a first test — nowhere near "small candidate set," and far too many
+  pairs to featurize at full scale (2.2M × 1,790 ≈ 3.9B pairs). Added a
+  cheap rarity-weighted score (`blocking.py: scored_candidates_for`) that
+  prunes to the top-25-per-source *before* any rapidfuzz/LightGBM feature
+  is computed, dropping recall only slightly (94.4%) while cutting the
+  average to ~50 candidates/entity. This *is* `candidate_pairs.tsv` — the
+  exact set the matcher scores, per the spec.
+- **A real bug worth flagging for anyone extending this code:** the first
+  working version of the context-feature step (`add_context_features`)
+  sorted the per-pair table before computing rank/gap window functions, but
+  the caller's `y`/`groups` arrays had already been extracted from the
+  *pre-sort* row order — an easy silent desync (nothing raises; the model
+  just trains against shuffled labels). It collapsed stage-2 AUC from 0.9998
+  to 0.55 (random). Fixed by never reordering the table (`.over()` doesn't
+  require sorted input) — see the comment left in `pipeline.py` at that
+  function. Worth an assertion/test if this pipeline grows further.
+- **Validated results so far** (GroupKFold-by-S1 out-of-fold, so this is a
+  legitimate unbiased estimate, not train-set leakage):
+  - Small subsample (8,000 S1 + a ~74K-record distractor pool per source,
+    for fast iteration): blocking recall ceiling 94.4% at ~50
+    candidates/entity, **macro F0.5 = 0.958**.
+  - Full India partition (883,188 S1 against the *real* 2.0M/2.1M S2/S3
+    pool — the honest full-scale distractor density): run launched in the
+    background; numbers to be filled in once it completes (full-corpus
+    normalization is the slow part — see the README's scale note).
+  - The gap between those two is exactly the "more distractors → more
+    chance false-positive collisions → precision drops a bit" effect flagged
+    in section 8's validation protocol; the India-partition number is the
+    one to trust for planning, not the subsample's.
+- **Not yet implemented** (Phase 5 in the README): cross-encoder stacking,
+  and per-entity expected-F0.5 decoding (currently a single global
+  probability threshold, chosen on OOF predictions — simpler, and the
+  GroupKFold calibration already keeps it leakage-free, but a per-entity
+  decode should still add a bit more, particularly on borderline
+  multi-match entities).

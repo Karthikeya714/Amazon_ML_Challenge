@@ -1,0 +1,15 @@
+# Raw dataset (huge; not meant to be committed — download/extract locally)
+data/
+*.tsv
+*.parquet
+
+# Model artifacts / caches
+*.pkl
+*.joblib
+*.bin
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Outputs (regenerate via pipeline; keep small samples only if needed)
+output/*.tsv
