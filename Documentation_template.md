@@ -85,8 +85,7 @@ generic heuristic.
   of posting-list length) then prunes the union down to the top-N candidates
   per Source-2/Source-3 side — this pruned list *is* `candidate_pairs.tsv`,
   the exact set the matcher scores.
-- **Candidate pairs generated:** [fill in from the run: avg candidates/entity
-  × entities scored]
+- **Candidate pairs generated:** ~48.5 candidates/entity on average (9,692,290 total pairs for the 200,000-entity training run reported below).
 - **How true matches were not lost:** held out validation (GroupKFold by
   Source-1 entity) measures blocking *recall ceiling* — the fraction of true
   match edges present in the candidate set before the matcher ever sees them
@@ -135,8 +134,8 @@ leaderboard metric) via grid search, rather than a generic 0.5 cutoff.
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** [fill in from the run]
-- **Blocking recall ceiling / avg candidates per Source-1 entity:** [fill in]
+- **F_0.5 Score (macro):** 0.7449, measured via GroupKFold out-of-fold predictions on 200,000 Source-1 entities (both US and India) scored against the full, real Source-2/3 candidate pool (5,034,616 / 5,285,603 records) -- not a downsampled distractor pool, so this reflects true full-corpus distractor density.
+- **Blocking recall ceiling / avg candidates per Source-1 entity:** 69.4% recall ceiling at ~48.5 candidates/entity (690,940 true match edges, 479,607 recovered before the matcher ever sees the rest).
 - **Common false positives (wrong merges):** candidates sharing a common,
   high-frequency address locality/city token (more likely in dense Indian
   cities, where no PIN code is available to disambiguate) with a

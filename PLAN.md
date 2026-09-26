@@ -276,18 +276,82 @@ it). Deviations from the original plan, and why:
   shows up by running the real 5M-row files, not the toy examples in the
   problem PDF, which is why section 8's validation protocol insists on a
   full-country check before trusting any number.
-- **Validated results so far** (GroupKFold-by-S1 out-of-fold, so this is a
+- **Two more real bugs found the same way, both in the training stage,
+  both only visible once the feature table itself finally got large
+  enough (42.5M rows, full India partition) for its own memory cost to
+  matter:**
+  - `build_feature_table`'s candidate-side normalization cache
+    (`_normalize_needed`) collected **every unique candidate id across
+    all 883K Source-1 entities first**, normalized all of them, and held
+    the whole result in one dict for the rest of the run — an eager
+    pre-pass that ran *before* the batched/chunked pair loop (the fix
+    two bullets up) ever got a chance to bound anything. At ~48
+    candidates/entity this unique-touched-id set is millions of records,
+    several GB by itself. Replaced with `_get_normalized`: a small
+    bounded FIFO cache (300K entries, ~1GB/source) that normalizes on
+    first use and evicts the oldest entry once full — bounded regardless
+    of corpus size or candidate density, at the cost of occasionally
+    re-normalizing a record touched by several Source-1 entities.
+  - `train_two_stage` kept the *full* feature table (~6.5GB at 42.5M
+    rows) alive throughout training **in addition to** `X1`/`X2`, numpy
+    copies of those exact same feature columns (~4-5GB each) built via
+    `table.select(FEATURE_NAMES).to_numpy()`. During a fold's `.fit()`
+    that stacked with LightGBM's own binned dataset and that fold's
+    training-slice copy to land right at the 15GB ceiling. Fixed by
+    never re-selecting `FEATURE_NAMES` back out of a polars DataFrame
+    once `X1` exists: everything downstream of training only ever reads
+    `s1_id`/`cand_id`/`label`/`prob` columns (verified against every call
+    site), so training now keeps a slim id-only frame alongside the
+    numpy arrays and combines Stage 2's context features via
+    `np.hstack` — the pairwise feature values exist exactly once, as the
+    array actually being trained on. Applied the same fix to
+    `predict_with_models`, the function that scores the real test set.
+  - Each of these took a ~1-3 hour full-India-partition run to surface
+    (the earlier stages all had to complete first), which is why the
+    fixes above came one at a time rather than all at once — every
+    retry cost real wall-clock time to reach the point that would
+    reveal the *next* bug.
+- **Under deadline pressure, re-prioritized validation strategy:**
+  running the full 2.2M-entity training set end to end (after the
+  India-only partition alone took 8 attempts and ~3.5 hours just to get
+  through feature-table construction) was not going to finish in time
+  for a submission due the next day. A large, representative *sample* of
+  Source-1 entities trains an equally robust matcher in a fraction of
+  the time, without touching the real Source-2/3 candidate pool (so
+  blocking recall/precision still reflect true full-corpus distractor
+  density) — the actual full-coverage requirement is that **every test
+  entity gets a prediction**, not that training itself sees every
+  training entity. Added `--max-s1` to `run_pipeline.py` (samples
+  Source 1 before the expensive stages; ground truth is restricted to
+  the same sampled ids, since scoring against the full ground-truth
+  dict while only having predictions for a sample would silently and
+  massively undercount recall/F0.5).
+- **Validated results** (GroupKFold-by-S1 out-of-fold, so this is a
   legitimate unbiased estimate, not train-set leakage):
   - Small subsample (8,000 S1 + a ~74K-record distractor pool per source,
     for fast iteration): blocking recall ceiling 94.4% at ~50
-    candidates/entity, **macro F0.5 = 0.958**.
-  - Full India partition (883,188 S1 against the *real* 2.0M/2.1M S2/S3
-    pool — the honest full-scale distractor density): re-launched after the
-    memory fix above; numbers to be filled in once it completes.
-  - The gap between those two is exactly the "more distractors → more
-    chance false-positive collisions → precision drops a bit" effect flagged
-    in section 8's validation protocol; the India-partition number is the
-    one to trust for planning, not the subsample's.
+    candidates/entity, **macro F0.5 = 0.958**. Useful for catching bugs
+    fast; too small a distractor pool to trust for planning.
+  - **Full-corpus-density result (the one to trust): 200,000 sampled
+    Source-1 entities (both US and India, `--max-s1 200000`) against
+    the real, complete Source 2/3 pool (5,034,616 / 5,285,603 records) —
+    blocking recall ceiling 69.4%, ~48.5 candidates/entity, 690,940 true
+    match edges, 479,607 recovered, ​**macro F0.5 = 0.7449**.** Total run
+    time ~78 minutes (indexing ~13 min, candidate generation ~10-15 min,
+    feature-table build over 9.69M pairs ~55 min, training ~13 min).
+  - The gap between the two (0.958 vs. 0.745) is exactly the "more
+    distractors → more chance false-positive collisions → precision
+    drops, and more real high-frequency tokens the candidate cap can't
+    fully capture → recall drops" effect flagged in section 8's
+    validation protocol. 0.7449 is the number that reflects what a full
+    test-set submission should actually score, not 0.958.
+- **The main remaining lever, correctly identified but not chased under
+  the deadline:** blocking recall ceiling (69.4%) is the binding
+  constraint on the final score — no matcher, however good, can recover
+  a true match blocking never presented as a candidate. Section 5's
+  "Phase 5" fix (IDF-weighted cosine or embedding-based retrieval instead
+  of posting-list-presence blocking with an absolute frequency cap) is
+  the correct next investment, not further matcher tuning.
 - **Not yet implemented** (Phase 5 in the README): cross-encoder stacking,
   and per-entity expected-F0.5 decoding (currently a single global
   probability threshold, chosen on OOF predictions — simpler, and the
