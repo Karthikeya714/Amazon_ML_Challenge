@@ -358,3 +358,53 @@ it). Deviations from the original plan, and why:
   GroupKFold calibration already keeps it leakage-free, but a per-entity
   decode should still add a bit more, particularly on borderline
   multi-match entities).
+- **The real full test-set prediction run — the actual submission —
+  needed two more fixes, and both were the same lesson as every earlier
+  one: a Python-level per-row operation that's invisible at any
+  moderate scale becomes the binding constraint at the true 1.73M-entity,
+  ~84M-candidate-pair scale, and there is no shortcut for test-set
+  prediction (no `--max-s1` equivalent; every test entity needs a row):**
+  - There is no training-side sampling shortcut on the test side, so
+    `run_predict` was rewritten to process Source-1 entities in **chunks
+    of 100K**, checkpointing each chunk's tiny (s1_id, cand_id, prob)
+    result to a parquet file the instant it's scored, discarding
+    everything else. This also made the run resilient to this
+    environment's container restarting mid-run (which happened twice)
+    — a resumed run skips every chunk whose checkpoint already exists,
+    so at most one chunk's work (a few minutes) is ever lost instead of
+    the whole multi-hour run.
+  - Even after chunking got all the way through scoring (all 18 chunks
+    checkpointed, 83,734,065 total candidate pairs, successfully
+    concatenated), the **final decode step** — turning that table into
+    the two output files — died twice more, both for the same root
+    cause: converting an 83.7M-row table into Python dict-of-lists
+    boxes one Python string object per candidate id, and short-string
+    Python objects cost roughly 50 bytes of pure interpreter overhead
+    each on top of the actual data. First fix: replaced the row-by-row
+    `zip(table["s1_id"], table["cand_id"])` Python loop with a single
+    vectorized polars `group_by("s1_id").agg(pl.col("cand_id").str.join(","))`
+    — grouping and joining entirely in Arrow/Rust before touching Python
+    at all. That still died, because the grouped result was then split
+    back into a per-candidate Python list (`joined.split(",")`) to match
+    the existing List[str]-based writer — silently re-creating the exact
+    same ~84M-small-objects cost one line later. Final fix: added
+    `decode_threshold_joined`/`candidates_joined_from_table` that return
+    the joined string directly (Dict[str, str], ~1.7M entries — one per
+    Source-1 entity, not one per candidate pair), and
+    `io_utils.write_joined_tsv`, which writes that string straight to
+    the file with no further per-candidate processing — skipping the
+    dedup step the List[str] writer does, safe here because this
+    pipeline's candidate ids are already guaranteed unique by
+    construction (disjoint S2-/S3- namespaces; each source's own top-N
+    selection can't repeat a row).
+  - **Final result, the real submission:** full test set (1,732,544
+    Source-1 entities: US, India, and France — unseen at train time,
+    259,452 entities, handled by the same country-agnostic code with no
+    special-casing) — `matching_results.tsv` has 363,733 predicted
+    singletons and 1,368,811 entities with at least one match;
+    `candidate_pairs.tsv` has 1,689,242 entities with at least one
+    candidate and 43,302 with none. Both pass
+    `utils/validate_submission.py --check-ids` (9,969,589 valid match
+    ids checked) end to end. Total wall-clock time for the full test
+    run: ~5 hours (candidate generation and featurization dominate; the
+    fixed decode step itself takes under a minute).

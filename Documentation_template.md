@@ -209,5 +209,20 @@ pipeline).
 
 ### B. Additional Results
 
-[Fill in: blocking recall-vs-candidate-count trade-off at full scale, and
-any per-country breakdown, once available.]
+**Real full test-set submission** (the actual leaderboard upload), produced
+by running the trained model against the complete, real test set --
+1,732,544 Source-1 entities across US, India, **and France** (unseen at
+train time, 259,452 entities, handled with no country-specific code path):
+
+- `matching_results.tsv`: 363,733 entities predicted as singletons (no
+  match), 1,368,811 with at least one match.
+- `candidate_pairs.tsv`: 1,689,242 entities with at least one candidate,
+  43,302 with none (blocking found nothing plausible).
+- Both files pass the organizers' `utils/validate_submission.py`
+  end-to-end, including the `--check-ids` existence check against the
+  real test Source-2/3 files (9,969,589 valid match ids).
+- Total pipeline runtime for the full test set: about 5 hours of
+  compute (candidate generation and featurization dominate; the final
+  decode step, after two rounds of fixing genuine out-of-memory bugs at
+  that exact step -- see PLAN.md sec. 12 -- took under a minute once
+  correctly vectorized).
