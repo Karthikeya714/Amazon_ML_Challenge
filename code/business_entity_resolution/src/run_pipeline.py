@@ -30,6 +30,8 @@ import os
 import pickle
 import time
 
+import polars as pl
+
 import io_utils
 import pipeline as pl_mod
 from evaluate import blocking_diagnostics, macro_f_beta
@@ -114,7 +116,20 @@ def run_validate(data_dir: str, out_dir: str, model_out: str, n_folds: int, max_
     pl_mod.log(f"saved models to {model_out}", t0)
 
 
-def run_predict(data_dir: str, out_dir: str, model_in: str) -> None:
+def run_predict(data_dir: str, out_dir: str, model_in: str, chunk_size: int = 100_000) -> None:
+    """Processes Source-1 test entities in chunks of ``chunk_size``:
+    candidates -> features -> score, keeping only the slim (s1_id, cand_id,
+    prob) result from each chunk before moving to the next. Necessary
+    because there is no test-side equivalent of --max-s1 sampling -- every
+    test entity needs a prediction, and at full test scale (~1.73M
+    entities, ~84M candidate pairs) even the batched/slim-table feature
+    pipeline that worked for the 200K-entity training run would need an
+    estimated ~21GB for one single combined feature table, over this
+    environment's 15GB ceiling (see PLAN.md sec. 12). s1/s2/s3/the posting
+    indexes are the one part that must stay resident across every chunk
+    (each chunk's candidate generation needs them); chunking bounds only
+    the part that actually scales with total candidate-pair volume.
+    """
     t0 = time.time()
     with open(model_in, "rb") as f:
         saved = pickle.load(f)
@@ -128,25 +143,37 @@ def run_predict(data_dir: str, out_dir: str, model_in: str) -> None:
 
     idx_s2 = pl_mod.build_country_indexes_lazy(s2)
     idx_s3 = pl_mod.build_country_indexes_lazy(s3)
-    candidates = pl_mod.generate_candidates(s1, idx_s2, idx_s3)
-    pl_mod.log("candidates generated", t0)
-    del idx_s2, idx_s3
+    pl_mod.log(f"built blocking indexes: s2 countries={list(idx_s2)} s3 countries={list(idx_s3)}", t0)
+
+    all_ids = s1.ids
+    n = len(all_ids)
+    slim_chunks = []
+    for start in range(0, n, chunk_size):
+        chunk_ids = all_ids[start : start + chunk_size]
+        candidates = pl_mod.generate_candidates(s1, idx_s2, idx_s3, ids=chunk_ids)
+        table = pl_mod.build_feature_table(s1, s2, s3, candidates, labels=None)
+        del candidates
+        table = pl_mod.predict_with_models(table, models)  # already slim: s1_id, cand_id, prob(_raw)
+        slim_chunks.append(table.select(["s1_id", "cand_id", "prob"]))
+        del table
+        gc.collect()
+        pl_mod.log(f"chunk {start:,}-{start+len(chunk_ids):,}/{n:,} scored", t0)
+
+    del idx_s2, idx_s3, s2, s3
     gc.collect()
 
-    table = pl_mod.build_feature_table(s1, s2, s3, candidates, labels=None)
-    pl_mod.log(f"feature table built: {table.shape}", t0)
-
-    del s2, s3, candidates
+    full = pl.concat(slim_chunks, how="vertical")
+    del slim_chunks
     gc.collect()
+    pl_mod.log(f"all chunks scored and concatenated: {full.shape}", t0)
 
-    table = pl_mod.predict_with_models(table, models)
-    table = pl_mod.apply_one_owner_constraint(table, prob_col="prob")
-    predictions = pl_mod.decode_threshold(table, "prob_owned", tau)
-    for s1_id in s1.ids:
+    full = pl_mod.apply_one_owner_constraint(full, prob_col="prob")
+    predictions = pl_mod.decode_threshold(full, "prob_owned", tau)
+    for s1_id in all_ids:
         predictions.setdefault(s1_id, [])
 
-    candidate_map = pl_mod.candidates_dict_from_table(table)
-    for s1_id in s1.ids:
+    candidate_map = pl_mod.candidates_dict_from_table(full)
+    for s1_id in all_ids:
         candidate_map.setdefault(s1_id, [])
 
     os.makedirs(out_dir, exist_ok=True)

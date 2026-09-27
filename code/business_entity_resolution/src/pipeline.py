@@ -149,6 +149,7 @@ def generate_candidates(
     idx_s3_by_country: Dict[str, CountryBlockIndex],
     cap_per_token: int = 2000,
     top_n_per_source: int = 25,
+    ids: Optional[List[str]] = None,
 ) -> Dict[str, List[str]]:
     """Stage B (loose union retrieval) + Stage C (cheap-score prune to
     ``top_n_per_source`` per S2 and per S3) combined. The pruned list this
@@ -157,12 +158,17 @@ def generate_candidates(
     for why an unpruned union averaged ~1,800 candidates/entity here --
     fine for recall, far too large to featurize at full scale or to submit
     as a "small candidate set").
+
+    ``ids`` restricts processing to a subset of ``s1``'s entities (used by
+    the chunked test-set prediction path in run_pipeline.py); defaults to
+    every entity in ``s1``.
     """
+    ids = ids if ids is not None else s1.ids
     candidates: Dict[str, List[str]] = {}
     t0 = time.time()
-    for i, eid in enumerate(s1.ids):
+    for i, eid in enumerate(ids):
         if i and i % 100_000 == 0:
-            print(f"  generate_candidates: {i}/{len(s1.ids)} ({time.time()-t0:.0f}s elapsed)", flush=True)
+            print(f"  generate_candidates: {i}/{len(ids)} ({time.time()-t0:.0f}s elapsed)", flush=True)
         c = s1.countries[eid]
         name, addr = s1.names[eid], s1.addrs[eid]
         cand_ids: List[str] = []
