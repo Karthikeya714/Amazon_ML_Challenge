@@ -184,17 +184,19 @@ def run_predict(data_dir: str, out_dir: str, model_in: str, chunk_size: int = 10
     pl_mod.log(f"all chunks scored and concatenated: {full.shape}", t0)
 
     full = pl_mod.apply_one_owner_constraint(full, prob_col="prob")
-    predictions = pl_mod.decode_threshold(full, "prob_owned", tau)
-    for s1_id in all_ids:
-        predictions.setdefault(s1_id, [])
-
-    candidate_map = pl_mod.candidates_dict_from_table(full)
-    for s1_id in all_ids:
-        candidate_map.setdefault(s1_id, [])
+    # The *_joined variants (not decode_threshold/candidates_dict_from_table,
+    # which run_validate uses) never split a joined string back into a
+    # per-candidate Python list -- at 83.7M rows that split is exactly what
+    # OOM-killed this step a second time, right after the first fix
+    # (grouping instead of a row-by-row zip()) got it past the first OOM
+    # here. See pipeline.py's _grouped_join_strings docstring.
+    predictions = pl_mod.decode_threshold_joined(full, "prob_owned", tau)
+    candidate_map = pl_mod.candidates_joined_from_table(full)
+    pl_mod.log(f"decoded: {len(predictions)} matched, {len(candidate_map)} with candidates", t0)
 
     os.makedirs(out_dir, exist_ok=True)
-    io_utils.write_matching_results(os.path.join(out_dir, "matching_results.tsv"), predictions)
-    io_utils.write_candidate_pairs(os.path.join(out_dir, "candidate_pairs.tsv"), candidate_map)
+    io_utils.write_joined_tsv(os.path.join(out_dir, "matching_results.tsv"), predictions, all_ids, io_utils.MATCH_HEADER)
+    io_utils.write_joined_tsv(os.path.join(out_dir, "candidate_pairs.tsv"), candidate_map, all_ids, io_utils.CANDIDATE_HEADER)
     pl_mod.log(f"wrote outputs to {out_dir}", t0)
 
 

@@ -434,6 +434,32 @@ def candidates_dict_from_table(table: pl.DataFrame) -> Dict[str, List[str]]:
     return _grouped_join(table)
 
 
+def _grouped_join_strings(table: pl.DataFrame) -> Dict[str, str]:
+    """Same grouping as _grouped_join, but returns the joined string
+    itself, never split back into a Python list. At full test-set scale
+    (83.7M rows), _grouped_join's per-entity .split(",") call still boxes
+    one Python string per candidate id (~83.7M of them) -- this is what
+    OOM-killed the real test-set run a second time, right after the first
+    fix (grouping instead of row-by-row zip()) got it past the first OOM
+    at the same step. This version boxes only ~1.7M Python objects total
+    (one already-joined string per Source-1 entity), because the caller
+    (io_utils.write_joined_tsv) writes that string straight to the file
+    with no further per-candidate processing needed. Used only by the
+    full test-set predict path (run_predict), never run_validate, which
+    needs real List[str] to score against ground truth.
+    """
+    grouped = table.group_by("s1_id").agg(pl.col("cand_id").str.join(","))
+    return dict(zip(grouped["s1_id"], grouped["cand_id"]))
+
+
+def decode_threshold_joined(table: pl.DataFrame, prob_col: str, tau: float) -> Dict[str, str]:
+    return _grouped_join_strings(table.filter(pl.col(prob_col) >= tau))
+
+
+def candidates_joined_from_table(table: pl.DataFrame) -> Dict[str, str]:
+    return _grouped_join_strings(table)
+
+
 def predict_with_models(table: pl.DataFrame, models: dict) -> pl.DataFrame:
     """Inference-time scoring on the (unlabeled) test candidate table,
     averaging the CV folds' models -- no OOF trick needed since there is no

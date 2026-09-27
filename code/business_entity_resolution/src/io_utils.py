@@ -78,6 +78,29 @@ def write_id_list_tsv(path: str, mapping: Dict[str, List[str]], header: List[str
             f.write(f"{s1_id}\t{','.join(clean)}\n")
 
 
+def write_joined_tsv(path: str, joined: Dict[str, str], required_ids: List[str], header: List[str]) -> None:
+    """Write a {source1_id: "id1,id2,..."} mapping (values already
+    comma-joined, e.g. by pipeline.py's `_grouped_join_strings`) as a
+    two-column TSV, iterating ``required_ids`` rather than ``joined`` so
+    every required Source-1 id gets a row even if it has no entry (empty
+    list) in ``joined``.
+
+    Skips the per-id dedup/list-rebuild `write_id_list_tsv` does -- this
+    pipeline's candidate ids are already guaranteed unique by construction
+    (S2-/S3- id namespaces are disjoint, and each source's own top-N
+    selection can't repeat a row), so re-parsing every joined string back
+    into a list here would undo the whole point of joining in polars in
+    the first place (see pipeline.py's `_grouped_join_strings` docstring:
+    this is what let the full test-set run finish instead of OOM-killing
+    a second time on an 83.7M-row decode).
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\t".join(header) + "\n")
+        for s1_id in required_ids:
+            f.write(f"{s1_id}\t{joined.get(s1_id, '')}\n")
+
+
 def write_matching_results(path: str, mapping: Dict[str, List[str]]) -> None:
     write_id_list_tsv(path, mapping, MATCH_HEADER)
 
