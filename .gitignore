@@ -23,3 +23,9 @@ submission.zip
 # decode-strategy testing) -- not part of the committed deliverable.
 output_improve/
 output_test/
+
+# Gemini-notebook-derived pipeline: working/output dirs are regenerable
+# run artifacts (dicts, parquet checkpoints, predictions) -- only the
+# source code under gemini_pipeline/src is a committed deliverable.
+gemini_work/
+gemini_out/
