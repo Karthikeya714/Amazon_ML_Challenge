@@ -18,3 +18,8 @@ output/*.tsv
 # output TSVs above; GitHub hard-blocks any push over 100MB anyway).
 # Delivered to the user directly from the working directory instead.
 submission.zip
+
+# Scratch experiment directories (re-run outputs, OOF checkpoints for
+# decode-strategy testing) -- not part of the committed deliverable.
+output_improve/
+output_test/
