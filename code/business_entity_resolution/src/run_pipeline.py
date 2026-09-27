@@ -145,26 +145,42 @@ def run_predict(data_dir: str, out_dir: str, model_in: str, chunk_size: int = 10
     idx_s3 = pl_mod.build_country_indexes_lazy(s3)
     pl_mod.log(f"built blocking indexes: s2 countries={list(idx_s2)} s3 countries={list(idx_s3)}", t0)
 
+    # Each chunk's (tiny) result is written to disk immediately. This
+    # environment's container has already restarted once mid-run, silently
+    # killing whatever was in memory with no way to resume -- on a
+    # deadline, losing a multi-hour run to that twice is not acceptable.
+    # A restarted process just needs to be invoked again: any chunk whose
+    # checkpoint file already exists is skipped, so at most one chunk's
+    # worth of work (a few minutes) is ever lost.
+    ckpt_dir = os.path.join(out_dir, "_chunks")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
     all_ids = s1.ids
     n = len(all_ids)
-    slim_chunks = []
-    for start in range(0, n, chunk_size):
+    chunk_starts = list(range(0, n, chunk_size))
+    for start in chunk_starts:
+        ckpt_path = os.path.join(ckpt_dir, f"chunk_{start:09d}.parquet")
+        if os.path.exists(ckpt_path):
+            pl_mod.log(f"chunk {start:,}-{start+chunk_size:,}/{n:,} already checkpointed, skipping", t0)
+            continue
         chunk_ids = all_ids[start : start + chunk_size]
         candidates = pl_mod.generate_candidates(s1, idx_s2, idx_s3, ids=chunk_ids)
         table = pl_mod.build_feature_table(s1, s2, s3, candidates, labels=None)
         del candidates
         table = pl_mod.predict_with_models(table, models)  # already slim: s1_id, cand_id, prob(_raw)
-        slim_chunks.append(table.select(["s1_id", "cand_id", "prob"]))
+        table.select(["s1_id", "cand_id", "prob"]).write_parquet(ckpt_path + ".tmp")
+        os.replace(ckpt_path + ".tmp", ckpt_path)  # atomic -- never a half-written checkpoint
         del table
         gc.collect()
-        pl_mod.log(f"chunk {start:,}-{start+len(chunk_ids):,}/{n:,} scored", t0)
+        pl_mod.log(f"chunk {start:,}-{start+len(chunk_ids):,}/{n:,} scored and checkpointed", t0)
 
     del idx_s2, idx_s3, s2, s3
     gc.collect()
 
-    full = pl.concat(slim_chunks, how="vertical")
-    del slim_chunks
-    gc.collect()
+    full = pl.concat(
+        [pl.read_parquet(os.path.join(ckpt_dir, f"chunk_{start:09d}.parquet")) for start in chunk_starts],
+        how="vertical",
+    )
     pl_mod.log(f"all chunks scored and concatenated: {full.shape}", t0)
 
     full = pl_mod.apply_one_owner_constraint(full, prob_col="prob")
