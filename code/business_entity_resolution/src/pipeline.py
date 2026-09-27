@@ -405,19 +405,33 @@ def search_threshold(table: pl.DataFrame, ground_truth: Dict[str, List[str]], pr
     return best_tau, best_score
 
 
-def decode_threshold(table: pl.DataFrame, prob_col: str, tau: float) -> Dict[str, List[str]]:
-    kept = table.filter(pl.col(prob_col) >= tau)
-    out: Dict[str, List[str]] = defaultdict(list)
-    for s1_id, cand_id in zip(kept["s1_id"], kept["cand_id"]):
-        out[s1_id].append(cand_id)
+def _grouped_join(table: pl.DataFrame) -> Dict[str, List[str]]:
+    """Group by s1_id and join cand_id with a comma, entirely in polars
+    (vectorized/Arrow), then split back into Python lists only once per
+    *entity* -- not once per candidate pair. At full test-set scale (83.7M
+    rows) the original row-by-row ``zip(table["s1_id"], table["cand_id"])``
+    Python loop boxed one Python string object per candidate id (~83.7M of
+    them, each costing ~50 bytes of pure object overhead on top of the
+    actual string data) -- several GB just in interpreter bookkeeping, and
+    what actually OOM-killed the real test-set run right after all 18
+    prediction chunks had already completed successfully. Grouping first
+    means only ~1.7M (one per Source-1 entity) Python objects are ever
+    boxed, each holding an already-comma-joined string built by polars'
+    own (Rust-level) string-join -- not 83.7M small ones.
+    """
+    grouped = table.group_by("s1_id").agg(pl.col("cand_id").str.join(","))
+    out: Dict[str, List[str]] = {}
+    for s1_id, joined in zip(grouped["s1_id"], grouped["cand_id"]):
+        out[s1_id] = joined.split(",") if joined else []
     return out
+
+
+def decode_threshold(table: pl.DataFrame, prob_col: str, tau: float) -> Dict[str, List[str]]:
+    return _grouped_join(table.filter(pl.col(prob_col) >= tau))
 
 
 def candidates_dict_from_table(table: pl.DataFrame) -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = defaultdict(list)
-    for s1_id, cand_id in zip(table["s1_id"], table["cand_id"]):
-        out[s1_id].append(cand_id)
-    return out
+    return _grouped_join(table)
 
 
 def predict_with_models(table: pl.DataFrame, models: dict) -> pl.DataFrame:
