@@ -13,3 +13,8 @@ __pycache__/
 
 # Outputs (regenerate via pipeline; keep small samples only if needed)
 output/*.tsv
+
+# The assembled final-submission zip (hundreds of MB -- includes the huge
+# output TSVs above; GitHub hard-blocks any push over 100MB anyway).
+# Delivered to the user directly from the working directory instead.
+submission.zip
