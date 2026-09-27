@@ -88,6 +88,20 @@ def run_validate(data_dir: str, out_dir: str, model_out: str, n_folds: int, max_
     pl_mod.log("two-stage GroupKFold training complete", t0)
 
     table = pl_mod.apply_one_owner_constraint(table, prob_col="prob")
+
+    # Checkpoint the scored OOF table (s1_id, cand_id, label, prob, prob_owned)
+    # so decode-strategy experiments (global threshold vs. per-entity rules)
+    # can be tried and validated against real ground truth afterward without
+    # ever re-running the expensive candidate-gen/featurize/train stages
+    # again -- those are what took ~80 minutes here, not the decode step.
+    oof_path = os.path.join(out_dir, "oof_scored.parquet")
+    os.makedirs(out_dir, exist_ok=True)
+    table.write_parquet(oof_path)
+    import json
+    with open(os.path.join(out_dir, "oof_ground_truth.json"), "w") as f:
+        json.dump(ground_truth, f)
+    pl_mod.log(f"checkpointed OOF scores + ground truth to {out_dir}", t0)
+
     tau, val_score_owned = pl_mod.search_threshold(table, ground_truth, prob_col="prob_owned")
     pl_mod.log(f"best threshold tau={tau:.2f} (owned) macro_f0.5={val_score_owned:.4f}", t0)
 
